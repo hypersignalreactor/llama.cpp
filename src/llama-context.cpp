@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "models/ouro-adaptive.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -1828,6 +1829,59 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
+
+    // Apollos fork · Ouro adaptive depth: a single generated token is decoded one loop at a time and stops once the LM
+    // head is confident (see models/ouro-adaptive.h). Every stage is its own small graph over the same memory slot.
+    if (model.arch == LLM_ARCH_OURO && gtype != LLM_GRAPH_TYPE_ENCODER && ubatch.n_tokens == 1 && !ubatch.embd &&
+            !cparams.embeddings && ouro_stage().exit_p > 0.0f && ouro_stage().n_loops > 1) {
+        auto & st = ouro_stage();
+        const int64_t n_vocab = model.vocab.n_tokens();
+        std::vector<float> lg(n_vocab);
+        int s = 0;
+        for (; s < st.n_loops; ++s) {
+            st.stage = s;
+            const auto gp = graph_params(res, ubatch, mctx, gtype);
+            gf_res_prev_active = nullptr;
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            gf = model.build_graph(gp);
+            if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                st.stage = -1;
+                ret = gf ? GGML_STATUS_ALLOC_FAILED : GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            res->set_inputs(&ubatch);
+            const auto status = graph_compute(res->get_gf(), false);
+            if (status != GGML_STATUS_SUCCESS) {
+                st.stage = -1;
+                ret = status;
+                return nullptr;
+            }
+            ggml_backend_sched_synchronize(sched.get());
+            if (s == st.n_loops - 1) {
+                break;
+            }
+            if (s + 1 >= st.min_loops) {
+                ggml_backend_tensor_get(res->get_logits(), lg.data(), 0, n_vocab * sizeof(float));
+                float mx = lg[0];
+                for (int64_t v = 1; v < n_vocab; ++v) { if (lg[v] > mx) { mx = lg[v]; } }
+                double z = 0.0;
+                for (int64_t v = 0; v < n_vocab; ++v) { z += exp((double) lg[v] - mx); }
+                if (1.0 / z >= st.exit_p) {
+                    break;
+                }
+            }
+            auto * t_h = res->get_embd();
+            st.carry.resize(ggml_nelements(t_h));
+            ggml_backend_tensor_get(t_h, st.carry.data(), 0, ggml_nbytes(t_h));
+        }
+        st.n_exit[std::min(s, 15)]++;
+        st.stage = -1;
+        gf_res_prev_active = nullptr;   // the next call must not take this stage graph for a full one
+        ret = GGML_STATUS_SUCCESS;
+        return res;
+    }
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters

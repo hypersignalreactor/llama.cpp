@@ -1,6 +1,37 @@
 #include "models.h"
+#include "ouro-adaptive.h"
 
+#include "llama-kv-cache.h"
+
+#include <cstdio>
 #include <cstdlib>
+
+ouro_stage_state & ouro_stage() {
+    static ouro_stage_state st;
+    return st;
+}
+
+static void ouro_print_stats() {
+    const auto & st = ouro_stage();
+    int64_t n = 0, sum = 0;
+    for (int i = 0; i < st.n_loops && i < 16; ++i) { n += st.n_exit[i]; sum += st.n_exit[i] * (i + 1); }
+    if (n == 0) { return; }
+    fprintf(stderr, "ouro adaptive depth (p >= %.2f): %lld tokens, %.2f loops on average of %d; stopped after loop", st.exit_p, (long long) n, (double) sum / n, st.n_loops);
+    for (int i = 0; i < st.n_loops && i < 16; ++i) { fprintf(stderr, " %d: %lld", i + 1, (long long) st.n_exit[i]); }
+    fprintf(stderr, "\n");
+}
+
+// the hidden state carried from the previous loop (staged decoding)
+class llm_graph_input_ouro_carry : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch *) override {
+        const auto & st = ouro_stage();
+        GGML_ASSERT(st.carry.size() * sizeof(float) == ggml_nbytes(t));
+        ggml_backend_tensor_set(t, st.carry.data(), 0, ggml_nbytes(t));
+    }
+    bool can_reuse(const llm_graph_params &) override { return false; }
+    ggml_tensor * t = nullptr;
+};
 
 // Ouro (ByteDance Seed) — a looped / universal-transformer LM: the whole decoder stack is applied
 // `num_loops` times per token with shared weights. Reference: modeling_ouro.py, OuroModel.forward,
@@ -34,6 +65,19 @@ void llama_model_ouro::load_arch_hparams(llama_model_loader & ml) {
     // Bound-check before casting: signed int mul can overflow and bypass the guard.
     GGML_ASSERT((size_t) n_layer_phys * (size_t) n_loops_u <= (size_t) LLAMA_MAX_LAYERS);
     n_loops = (int) n_loops_u;
+
+    {
+        auto & st = ouro_stage();
+        st.n_loops = n_loops;
+        const char * ep = getenv("OURO_EXIT_P");
+        const char * ml = getenv("OURO_MIN_LOOPS");
+        st.exit_p    = ep ? (float) atof(ep) : 0.0f;
+        st.min_loops = ml ? atoi(ml) : 1;
+        if (st.exit_p > 0.0f && n_loops > 1) {
+            static bool once = false;
+            if (!once) { once = true; atexit(ouro_print_stats); }
+        }
+    }
 
     // Expand logical layer count before load_tensors() allocates layers / KV.
     if (n_loops > 1) {
@@ -120,7 +164,22 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    // staged decoding (see ouro-adaptive.h): only loop `stage` is built, fed by the previous loop's normed hidden state
+    const int  stage  = ouro_stage().stage;
+    const bool staged = stage >= 0;
+    const int  il_beg = staged ? stage * n_phys : 0;
+    const int  il_end = staged ? (stage + 1) * n_phys : (int) n_layer;
+
+    if (stage > 0) {
+        auto inp = std::make_unique<llm_graph_input_ouro_carry>();
+        inp->t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->t);
+        ggml_set_name(inp->t, "ouro_carry");
+        inpL = inp->t;
+        res->add_input(std::move(inp));
+    } else {
+        inpL = build_inp_embd(model.tok_embd);
+    }
 
     ggml_tensor * inp_pos = build_inp_pos();
 
@@ -130,7 +189,7 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
         ? 1.0f / sqrtf(float(n_embd_head))
         : hparams.f_attention_scale;
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = staged ? nullptr : build_inp_out_ids();
 
     // Apollos fork, probe mode (OURO_PROBE=1): expose every loop's exit-gate logit and LM-head logits as named nodes
     // ("ouro_gate-<loop>", "ouro_logits-<loop>") so a tool can read them through cb_eval. All positions must be outputs.
@@ -148,7 +207,7 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
         ggml_build_forward_expand(gf, lg);
     };
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_beg; il < il_end; ++il) {
         res->t_layer_inp[il] = inpL;
         ggml_tensor * inpSA = inpL;
 
@@ -165,6 +224,15 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
+
+            // copy this loop's K/V forward into every later loop's slot for these cells
+            if (staged) {
+                for (int j = stage + 1; j < n_loops; ++j) {
+                    const int il2 = il + (j - stage) * n_phys;
+                    ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il2));
+                    ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il2));
+                }
+            }
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
@@ -207,7 +275,7 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
 
         // The reference applies model.norm at the end of every loop, and the normed state is what
         // feeds the next loop. The final loop's norm is the shared one applied after this loop.
-        if (n_loops > 1 && ((il + 1) % n_phys) == 0 && (il + 1) < n_layer) {
+        if (!staged && n_loops > 1 && ((il + 1) % n_phys) == 0 && (il + 1) < n_layer) {
             cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "loop_norm", il);
             inpL = cur;
