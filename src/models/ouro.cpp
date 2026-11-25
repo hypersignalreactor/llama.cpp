@@ -73,6 +73,12 @@ void llama_model_ouro::load_arch_hparams(llama_model_loader & ml) {
         const char * ml = getenv("OURO_MIN_LOOPS");
         st.exit_p    = ep ? (float) atof(ep) : 0.0f;
         st.min_loops = ml ? atoi(ml) : 1;
+        const char * sp = getenv("OURO_STEP");
+        const char * fl = getenv("OURO_FILL");
+        st.step = sp ? atoi(sp) : 1;
+        st.fill = fl && fl[0] == 's' ? 1 : 0;
+        if (st.min_loops < 1) { st.min_loops = 1; }
+        if (st.step < 1) { st.step = 1; }
         if (st.exit_p > 0.0f && n_loops > 1) {
             static bool once = false;
             if (!once) { once = true; atexit(ouro_print_stats); }
@@ -165,12 +171,15 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inpL;
 
     // staged decoding (see ouro-adaptive.h): only loop `stage` is built, fed by the previous loop's normed hidden state
-    const int  stage  = ouro_stage().stage;
-    const bool staged = stage >= 0;
-    const int  il_beg = staged ? stage * n_phys : 0;
-    const int  il_end = staged ? (stage + 1) * n_phys : (int) n_layer;
+    const int  s_lo   = ouro_stage().lo;
+    const int  s_hi   = ouro_stage().hi;
+    const bool staged = s_lo >= 0;
+    const int  il_beg = staged ? s_lo * n_phys : 0;
+    const int  il_end = staged ? s_hi * n_phys : (int) n_layer;
+    const bool fill_copy  = staged && s_hi < n_loops && ouro_stage().fill == 0;
+    const bool fill_state = staged && s_hi < n_loops && ouro_stage().fill == 1;
 
-    if (stage > 0) {
+    if (s_lo > 0) {
         auto inp = std::make_unique<llm_graph_input_ouro_carry>();
         inp->t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp->t);
@@ -225,10 +234,10 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            // copy this loop's K/V forward into every later loop's slot for these cells
-            if (staged) {
-                for (int j = stage + 1; j < n_loops; ++j) {
-                    const int il2 = il + (j - stage) * n_phys;
+            // copy the stage's last loop's K/V forward into every later loop's slot for these cells
+            if (fill_copy && il >= (s_hi - 1) * n_phys) {
+                for (int j = s_hi; j < n_loops; ++j) {
+                    const int il2 = il + (j - (s_hi - 1)) * n_phys;
                     ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il2));
                     ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il2));
                 }
@@ -275,7 +284,7 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
 
         // The reference applies model.norm at the end of every loop, and the normed state is what
         // feeds the next loop. The final loop's norm is the shared one applied after this loop.
-        if (!staged && n_loops > 1 && ((il + 1) % n_phys) == 0 && (il + 1) < n_layer) {
+        if (n_loops > 1 && ((il + 1) % n_phys) == 0 && (il + 1) < il_end) {
             cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "loop_norm", il);
             inpL = cur;
@@ -289,6 +298,21 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
     tap(cur, n_loops);
+
+    // state fill: every later loop's K/V for these cells, projected from this stage's final hidden state
+    if (fill_state) {
+        for (int i = 0; i < n_phys; ++i) {
+            ggml_tensor * x = build_norm(cur, model.layers[i].attn_norm, NULL, LLM_NORM_RMS, i);
+            auto [Qf, Kf, Vf] = build_qkv(model.layers[i], x, n_embd_head, n_head, n_head_kv, i);
+            (void) Qf;
+            Kf = build_rope(Kf, inp_pos, i);
+            for (int j = s_hi; j < n_loops; ++j) {
+                const int il2 = i + j * n_phys;
+                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kf, inp_attn->get_k_idxs(), il2));
+                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vf, inp_attn->get_v_idxs(), il2));
+            }
+        }
+    }
 
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);

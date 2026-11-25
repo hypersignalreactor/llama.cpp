@@ -30,7 +30,7 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B build -DBUILD_SHARED_LIBS=ON -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=ON
-          cmake --build build --config Release -j 4 --target llama-server llama-completion llama-bench llama-ouro-probe
+          cmake --build build --config Release -j 4 --target llama-server llama-completion llama-bench llama-ouro-probe llama-ouro-agree
 
       - name: Pack
         run: 7z a apollos-looplm-win-vulkan-x64.zip .\build\bin\Release\*
