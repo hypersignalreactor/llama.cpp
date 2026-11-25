@@ -1,0 +1,40 @@
+name: Apollos · Windows Vulkan build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [apollos-looplm]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-vulkan:
+    runs-on: windows-2025
+    env:
+      VULKAN_VERSION: 1.4.357.0
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_UI=OFF
+          cmake --build build --config Release --target llama-server llama-completion llama-bench llama-ouro-probe
+
+      - name: Pack
+        run: 7z a apollos-looplm-win-vulkan-x64.zip .\build\bin\Release\*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apollos-looplm-win-vulkan-x64
+          path: apollos-looplm-win-vulkan-x64.zip

@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 // Ouro (ByteDance Seed) — a looped / universal-transformer LM: the whole decoder stack is applied
 // `num_loops` times per token with shared weights. Reference: modeling_ouro.py, OuroModel.forward,
 //
@@ -87,6 +89,10 @@ void llama_model_ouro::load_arch_tensors(llama_model_loader &) {
         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
     }
 
+    // Apollos fork: the early-exit gate (model.early_exit_gate, Linear(n_embd, 1)), stored as cls.output when present.
+    cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, 1}, TENSOR_NOT_REQUIRED);
+    cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   {1},         TENSOR_NOT_REQUIRED);
+
     // Share physical weights across loops; each slot still has its own KV index.
     if (n_loops > 1) {
         for (int j = 1; j < n_loops; ++j) {
@@ -125,6 +131,22 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
         : hparams.f_attention_scale;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    // Apollos fork, probe mode (OURO_PROBE=1): expose every loop's exit-gate logit and LM-head logits as named nodes
+    // ("ouro_gate-<loop>", "ouro_logits-<loop>") so a tool can read them through cb_eval. All positions must be outputs.
+    const bool probe = getenv("OURO_PROBE") != nullptr;
+    auto tap = [&](ggml_tensor * h, int loop) {
+        if (!probe) { return; }
+        if (model.cls_out) {
+            ggml_tensor * g = ggml_mul_mat(ctx0, model.cls_out, h);
+            if (model.cls_out_b) { g = ggml_add(ctx0, g, model.cls_out_b); }
+            ggml_format_name(g, "ouro_gate-%d", loop);
+            ggml_build_forward_expand(gf, g);
+        }
+        ggml_tensor * lg = build_lora_mm(model.output, h, model.output_s);
+        ggml_format_name(lg, "ouro_logits-%d", loop);
+        ggml_build_forward_expand(gf, lg);
+    };
 
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -189,6 +211,7 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
             cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "loop_norm", il);
             inpL = cur;
+            tap(cur, (il + 1) / n_phys);
         }
     }
 
@@ -197,6 +220,7 @@ llama_model_ouro::graph::graph(const llm_graph_params & params) :
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+    tap(cur, n_loops);
 
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
